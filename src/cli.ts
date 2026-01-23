@@ -5,8 +5,64 @@
 
 import { Command } from "commander";
 import pc from "picocolors";
+import { execSync } from "node:child_process";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { login } from "./auth.js";
-import { getCredentials, deleteCredentials, getConfig, saveConfig } from "./config.js";
+import { getCredentials, deleteCredentials, getConfig, saveConfig, getConfigDir } from "./config.js";
+
+const GIT_CREDENTIALS_FILE = join(homedir(), ".git-credentials");
+
+/**
+ * Configure git credential helper for Strayl
+ * Writes credentials to ~/.git-credentials and configures git to use store helper
+ */
+function setupGitCredentials(): void {
+  const config = getConfig();
+  const credentials = getCredentials();
+  if (!credentials) return;
+
+  const apiUrl = new URL(config.apiUrl);
+  const credentialLine = `${apiUrl.protocol}//${credentials.username}:${credentials.token}@${apiUrl.host}`;
+
+  // Read existing credentials file
+  let existingContent = "";
+  if (existsSync(GIT_CREDENTIALS_FILE)) {
+    existingContent = readFileSync(GIT_CREDENTIALS_FILE, "utf-8");
+  }
+
+  // Remove old Strayl credentials if present
+  const lines = existingContent.split("\n").filter(line => !line.includes(apiUrl.host));
+
+  // Add new credentials
+  lines.push(credentialLine);
+
+  // Write back
+  writeFileSync(GIT_CREDENTIALS_FILE, lines.filter(l => l.trim()).join("\n") + "\n", { mode: 0o600 });
+
+  // Configure git to use store helper for this host
+  try {
+    execSync(`git config --global credential.helper store`, { stdio: "pipe" });
+  } catch {
+    // Ignore if fails
+  }
+}
+
+/**
+ * Remove git credentials for Strayl
+ */
+function removeGitCredentials(): void {
+  const config = getConfig();
+  const apiUrl = new URL(config.apiUrl);
+
+  if (!existsSync(GIT_CREDENTIALS_FILE)) return;
+
+  // Remove Strayl credentials from file
+  const content = readFileSync(GIT_CREDENTIALS_FILE, "utf-8");
+  const lines = content.split("\n").filter(line => !line.includes(apiUrl.host));
+  writeFileSync(GIT_CREDENTIALS_FILE, lines.filter(l => l.trim()).join("\n") + "\n", { mode: 0o600 });
+}
 
 const program = new Command();
 
@@ -32,12 +88,19 @@ program
     try {
       console.log(pc.bold("Logging in to Strayl..."));
       const credentials = await login();
+
+      // Auto-configure git credentials
+      setupGitCredentials();
+
+      const config = getConfig();
+      const apiHost = new URL(config.apiUrl).host;
+
       console.log();
       console.log(pc.green("✓") + ` Logged in as ${pc.bold("@" + credentials.username)}`);
       console.log();
-      console.log(pc.dim("Git credentials configured. You can now:"));
-      console.log(pc.dim("  git clone https://api.strayl.dev/username/repo.git"));
-      console.log(pc.dim("  git push origin main"));
+      console.log("You can now:");
+      console.log(pc.dim(`  git clone https://${apiHost}/${credentials.username}/repo.git`));
+      console.log(pc.dim(`  git push origin main`));
     } catch (error) {
       console.error(pc.red("✗") + ` Login failed: ${error instanceof Error ? error.message : "Unknown error"}`);
       process.exit(1);
@@ -57,6 +120,8 @@ program
       return;
     }
 
+    // Remove git credentials first
+    removeGitCredentials();
     deleteCredentials();
     console.log(pc.green("✓") + ` Logged out from @${credentials.username}`);
   });
@@ -142,8 +207,8 @@ program
 
 program
   .command("setup-git")
-  .description("Configure git to use Strayl credentials")
-  .action(async () => {
+  .description("Re-configure git credentials (usually not needed)")
+  .action(() => {
     const credentials = getCredentials();
 
     if (!credentials) {
@@ -152,23 +217,15 @@ program
       process.exit(1);
     }
 
+    setupGitCredentials();
+
     const config = getConfig();
     const apiHost = new URL(config.apiUrl).host;
 
-    const { execSync } = await import("node:child_process");
-
-    try {
-      // Configure git credential helper for strayl
-      execSync(`git config --global credential.https://${apiHost}.helper strayl`, { stdio: "pipe" });
-      console.log(pc.green("✓") + ` Git configured to use Strayl credentials for ${apiHost}`);
-      console.log();
-      console.log(pc.dim("You can now use git commands with Strayl repositories:"));
-      console.log(pc.dim(`  git clone https://${apiHost}/username/repo.git`));
-    } catch (error) {
-      console.error(pc.red("✗") + " Failed to configure git");
-      console.error(pc.dim("Make sure git is installed and accessible"));
-      process.exit(1);
-    }
+    console.log(pc.green("✓") + " Git credentials configured");
+    console.log();
+    console.log(pc.dim("You can now use git commands with Strayl repositories:"));
+    console.log(pc.dim(`  git clone https://${apiHost}/${credentials.username}/repo.git`));
   });
 
 // ============ Parse & Run ============
