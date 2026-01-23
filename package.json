@@ -1,0 +1,47 @@
+{
+  "name": "@strayl/cli",
+  "version": "0.1.0",
+  "description": "Strayl CLI - Git hosting and deployment platform",
+  "type": "module",
+  "bin": {
+    "st": "./dist/cli.js",
+    "strayl": "./dist/cli.js",
+    "git-credential-strayl": "./dist/git-credential.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "open": "^10.1.0",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Strayl-Inc/strayl-cli.git"
+  },
+  "keywords": [
+    "strayl",
+    "cli",
+    "git",
+    "deployment"
+  ],
+  "author": "Strayl Inc",
+  "license": "MIT"
+}
