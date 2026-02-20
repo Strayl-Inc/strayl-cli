@@ -5,12 +5,26 @@
 
 import { Command } from "commander";
 import pc from "picocolors";
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { homedir, userInfo } from "node:os";
+import { join, basename } from "node:path";
 import { login } from "./auth.js";
 import { getCredentials, deleteCredentials, getConfig, saveConfig, getConfigDir } from "./config.js";
+import {
+  ApiError,
+  createProject,
+  getProjectInfo,
+  getRepoStatus,
+  proposeChangeFromBranch,
+  listChanges,
+  getChange,
+  mergeChange,
+  denyChange,
+  restackChange,
+  promoteToMain,
+  getProjectRole,
+} from "./api.js";
 
 const GIT_CREDENTIALS_FILE = join(homedir(), ".git-credentials");
 
@@ -226,6 +240,560 @@ program
     console.log();
     console.log(pc.dim("You can now use git commands with Strayl repositories:"));
     console.log(pc.dim(`  git clone https://${apiHost}/${credentials.username}/repo.git`));
+  });
+
+// ============ Shared Helpers ============
+
+/**
+ * Get { username, slug } from the 'strayl' git remote URL.
+ * e.g. https://api.strayl.dev/alice/myapp.git → { username: "alice", slug: "myapp" }
+ */
+function getProjectFromRemote(): { username: string; slug: string } | null {
+  try {
+    const url = execSync("git remote get-url strayl", { stdio: "pipe" }).toString().trim();
+    // e.g. https://api.strayl.dev/alice/myapp.git
+    const match = url.match(/\/([^/]+)\/([^/]+?)(?:\.git)?$/);
+    if (!match) return null;
+    return { username: match[1], slug: match[2] };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Ensure user is in a git repo, return true or print error and exit.
+ */
+function requireGitRepo(): void {
+  try {
+    execSync("git rev-parse --git-dir", { stdio: "pipe" });
+  } catch {
+    console.error(pc.red("✗") + " Not inside a git repository");
+    process.exit(1);
+  }
+}
+
+/**
+ * Ensure user is NOT already linked to a Strayl remote.
+ */
+function requireNoStraylRemote(): void {
+  try {
+    execSync("git remote get-url strayl", { stdio: "pipe" });
+    console.error(pc.red("✗") + " Already linked to a Strayl project");
+    console.error(pc.dim("  Run 'st status' to see the current project"));
+    process.exit(1);
+  } catch {
+    // Good — no remote means we can proceed
+  }
+}
+
+/**
+ * Convert a string into a URL-safe slug.
+ */
+function slugify(name: string): string {
+  return name
+    .toLowerCase()
+    .trim()
+    .replace(/[^\w\s-]/g, "")
+    .replace(/[\s_]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 100);
+}
+
+/**
+ * Require login — prints error and exits if not authenticated.
+ */
+function requireLogin() {
+  const creds = getCredentials();
+  if (!creds) {
+    console.error(pc.red("✗") + " Not logged in — run 'st login' first");
+    process.exit(1);
+  }
+  return creds;
+}
+
+/**
+ * Require the strayl remote to exist and return username/slug.
+ */
+function requireStraylRemote(): { username: string; slug: string } {
+  const remote = getProjectFromRemote();
+  if (!remote) {
+    console.error(pc.red("✗") + " No Strayl remote found");
+    console.error(pc.dim("  Run 'st init' to create a project or 'st link' to link an existing one"));
+    process.exit(1);
+  }
+  return remote;
+}
+
+/**
+ * Format a date as a human-readable age string.
+ */
+function formatAge(dateStr: string): string {
+  const diff = Date.now() - new Date(dateStr).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 60) return `${mins}m`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h`;
+  const days = Math.floor(hrs / 24);
+  return `${days}d`;
+}
+
+// ============ st init ============
+
+program
+  .command("init [name]")
+  .description("Create a new Strayl project from this repository")
+  .option("--name <name>", "Project name (defaults to current directory name)")
+  .option("--private", "Create a private project (default: public)")
+  .option("--description <d>", "Project description")
+  .action(async (nameArg: string | undefined, options) => {
+    requireGitRepo();
+    requireNoStraylRemote();
+    requireLogin();
+
+    const config = getConfig();
+    const cwd = process.cwd();
+    const dirName = basename(cwd);
+    const rawName = options.name || nameArg || dirName;
+    const slug = slugify(rawName);
+
+    if (!slug) {
+      console.error(pc.red("✗") + ` Cannot derive a valid project slug from "${rawName}"`);
+      process.exit(1);
+    }
+
+    const visibility: "public" | "private" = options.private ? "private" : "public";
+
+    console.log(pc.bold("Creating Strayl project..."));
+
+    let proj: any;
+    try {
+      const res = await createProject(rawName, slug, visibility, options.description) as any;
+      proj = res.project;
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.message : String(err);
+      console.error(pc.red("✗") + ` Failed to create project: ${msg}`);
+      process.exit(1);
+    }
+
+    const remoteUrl = `${config.apiUrl}/${proj.ownerUsername}/${proj.slug}.git`;
+    execSync(`git remote add strayl ${remoteUrl}`, { stdio: "pipe" });
+    setupGitCredentials();
+
+    console.log(pc.green("✓") + ` Project created: ${pc.cyan(`${config.appUrl}/${proj.ownerUsername}/${proj.slug}`)}`);
+    console.log();
+
+    // Ask whether to push to dev
+    const { createInterface } = await import("node:readline");
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await new Promise<string>((resolve) => {
+      rl.question(pc.dim("Push current code to dev? [Y/n] "), resolve);
+    });
+    rl.close();
+
+    if (!answer.trim() || answer.trim().toLowerCase() === "y") {
+      console.log(pc.dim("Pushing to strayl dev..."));
+      const push = spawnSync("git", ["push", "strayl", "HEAD:dev"], { stdio: "inherit" });
+      if (push.status !== 0) {
+        console.error(pc.yellow("⚠") + " Push failed. You can retry with: git push strayl HEAD:dev");
+      } else {
+        console.log(pc.green("✓") + " Pushed to dev");
+      }
+    }
+  });
+
+// ============ st link ============
+
+program
+  .command("link <project>")
+  .description("Link this repository to an existing Strayl project")
+  .option("--force-push", "Force-push local code to dev (only if dev is empty)")
+  .action(async (projectArg: string, options) => {
+    requireGitRepo();
+    requireNoStraylRemote();
+    requireLogin();
+
+    if (!projectArg.includes("/")) {
+      console.error(pc.red("✗") + " Use format: st link username/project");
+      process.exit(1);
+    }
+
+    const [username, slug] = projectArg.split("/");
+    const config = getConfig();
+
+    let status: { isEmpty: boolean; branch: string };
+    try {
+      status = await getRepoStatus(username, slug, "dev");
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.message : String(err);
+      console.error(pc.red("✗") + ` ${msg}`);
+      process.exit(1);
+    }
+
+    if (!status.isEmpty) {
+      console.error(pc.red("✗") + " Dev branch already has code.");
+      console.error(pc.dim(`  Use 'st clone ${username}/${slug}' to get the existing repository.`));
+      process.exit(1);
+    }
+
+    const remoteUrl = `${config.apiUrl}/${username}/${slug}.git`;
+    execSync(`git remote add strayl ${remoteUrl}`, { stdio: "pipe" });
+    setupGitCredentials();
+
+    console.log(pc.green("✓") + ` Linked: ${pc.cyan(`${config.appUrl}/${username}/${slug}`)}`);
+    console.log();
+
+    // Ask whether to push current code
+    const { createInterface } = await import("node:readline");
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await new Promise<string>((resolve) => {
+      rl.question(pc.dim("Push current code to dev? [Y/n] "), resolve);
+    });
+    rl.close();
+
+    if (!answer.trim() || answer.trim().toLowerCase() === "y") {
+      console.log(pc.dim("Pushing to strayl dev..."));
+      const pushArgs = ["push", "strayl", "HEAD:dev"];
+      if (options.forcePush) pushArgs.push("--force");
+      const push = spawnSync("git", pushArgs, { stdio: "inherit" });
+      if (push.status !== 0) {
+        console.error(pc.yellow("⚠") + " Push failed. You can retry with: git push strayl HEAD:dev");
+      } else {
+        console.log(pc.green("✓") + " Pushed to dev");
+      }
+    }
+  });
+
+// ============ st push ============
+
+program
+  .command("push [branch]")
+  .description("Push a branch and create a change proposal")
+  .option("--title <t>", "Change title (defaults to last commit message)")
+  .option("--description <d>", "Change description")
+  .option("--no-change", "Just push the branch, skip creating a change")
+  .action(async (branchArg: string | undefined, options) => {
+    requireGitRepo();
+    requireLogin();
+    const remote = requireStraylRemote();
+
+    // Determine current branch
+    let branch: string;
+    try {
+      branch = branchArg || execSync("git rev-parse --abbrev-ref HEAD", { stdio: "pipe" }).toString().trim();
+    } catch {
+      console.error(pc.red("✗") + " Cannot determine current branch");
+      process.exit(1);
+    }
+
+    if (branch === "main" || branch === "dev") {
+      console.error(pc.red("✗") + ` Cannot use 'st push' on branch '${branch}'`);
+      if (branch === "main") console.error(pc.dim("  Use 'st promote' to promote dev to main"));
+      if (branch === "dev") console.error(pc.dim("  Switch to a feature branch to propose changes"));
+      process.exit(1);
+    }
+
+    // Get title from last commit message if not provided
+    let title = options.title;
+    if (!title) {
+      try {
+        title = execSync("git log -1 --pretty=%s", { stdio: "pipe" }).toString().trim();
+      } catch {
+        title = branch;
+      }
+    }
+
+    // Push the branch
+    console.log(pc.dim(`Pushing ${branch} to strayl...`));
+    const { spawn } = await import("node:child_process");
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn("git", ["push", "strayl", `${branch}:${branch}`], { stdio: "inherit" });
+      child.on("exit", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`git push exited with code ${code}`));
+      });
+    }).catch((err) => {
+      console.error(pc.red("✗") + ` Push failed: ${err.message}`);
+      process.exit(1);
+    });
+
+    console.log(pc.green("✓") + ` Pushed ${pc.bold(branch)} → strayl`);
+
+    if (options.change === false) {
+      return;
+    }
+
+    // Create change proposal
+    console.log(pc.dim("Creating change proposal..."));
+    try {
+      const res = await proposeChangeFromBranch(
+        remote.username,
+        remote.slug,
+        branch,
+        title,
+        options.description
+      );
+      console.log(pc.green("✓") + ` Change created: ${pc.cyan(res.changeUrl)}`);
+      console.log(pc.dim(`  Status: ${res.change.status}`));
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.message : String(err);
+      console.error(pc.red("✗") + ` Failed to create change: ${msg}`);
+      process.exit(1);
+    }
+  });
+
+// ============ st changes ============
+
+program
+  .command("changes")
+  .description("List change proposals for this project")
+  .option("--status <s>", "Filter by status (proposed|merged|denied|needs_restack)")
+  .option("--mine", "Only show my changes")
+  .action(async (options) => {
+    requireGitRepo();
+    requireLogin();
+    const remote = requireStraylRemote();
+    const creds = getCredentials()!;
+
+    let res: { changes: any[] };
+    try {
+      res = await listChanges(remote.username, remote.slug, { status: options.status });
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.message : String(err);
+      console.error(pc.red("✗") + ` ${msg}`);
+      process.exit(1);
+    }
+
+    let items = res.changes;
+    if (options.mine) {
+      items = items.filter((ch: any) => ch.proposedBy === creds.username);
+    }
+
+    if (items.length === 0) {
+      console.log(pc.dim("No changes found"));
+      return;
+    }
+
+    // Print table
+    const idW = 12, titleW = 30, statusW = 16, statsW = 12, authorW = 14, ageW = 5;
+    const header = [
+      pc.bold("ID".padEnd(idW)),
+      pc.bold("TITLE".padEnd(titleW)),
+      pc.bold("STATUS".padEnd(statusW)),
+      pc.bold("+/-".padEnd(statsW)),
+      pc.bold("AUTHOR".padEnd(authorW)),
+      pc.bold("AGE"),
+    ].join("  ");
+    console.log(header);
+    console.log(pc.dim("─".repeat(idW + titleW + statusW + statsW + authorW + ageW + 10)));
+
+    for (const ch of items) {
+      const stats = ch.additions != null ? `+${ch.additions}/-${ch.deletions ?? 0}` : "-";
+      const statusColor = ch.status === "proposed" ? pc.cyan : ch.status === "merged" ? pc.green : ch.status === "denied" ? pc.red : pc.yellow;
+      const age = ch.createdAt ? formatAge(ch.createdAt) : "-";
+      const title = (ch.title || ch.chatTitle || "").slice(0, titleW);
+      const id = (ch.id || "").slice(0, idW);
+      console.log(
+        [
+          id.padEnd(idW),
+          title.padEnd(titleW),
+          statusColor((ch.status || "").padEnd(statusW)),
+          stats.padEnd(statsW),
+          (ch.proposedBy || "").slice(0, authorW).padEnd(authorW),
+          age,
+        ].join("  ")
+      );
+    }
+  });
+
+// ============ st change ============
+
+program
+  .command("change <id> [action]")
+  .description("View or act on a change (actions: approve, deny, restack)")
+  .action(async (changeId: string, action: string | undefined) => {
+    requireGitRepo();
+    requireLogin();
+    const remote = requireStraylRemote();
+
+    if (action === "approve") {
+      try {
+        await mergeChange(remote.username, remote.slug, changeId);
+        console.log(pc.green("✓") + ` Change ${changeId} approved and merged`);
+      } catch (err) {
+        const msg = err instanceof ApiError ? err.message : String(err);
+        console.error(pc.red("✗") + ` ${msg}`);
+        process.exit(1);
+      }
+      return;
+    }
+
+    if (action === "deny") {
+      try {
+        await denyChange(remote.username, remote.slug, changeId);
+        console.log(pc.green("✓") + ` Change ${changeId} denied`);
+      } catch (err) {
+        const msg = err instanceof ApiError ? err.message : String(err);
+        console.error(pc.red("✗") + ` ${msg}`);
+        process.exit(1);
+      }
+      return;
+    }
+
+    if (action === "restack") {
+      try {
+        await restackChange(remote.username, remote.slug, changeId);
+        console.log(pc.green("✓") + ` Change ${changeId} restacked`);
+      } catch (err) {
+        const msg = err instanceof ApiError ? err.message : String(err);
+        console.error(pc.red("✗") + ` ${msg}`);
+        process.exit(1);
+      }
+      return;
+    }
+
+    // No action — show details
+    try {
+      const res = await getChange(remote.username, remote.slug, changeId);
+      const ch = res.change;
+      const config = getConfig();
+      const statusColor = ch.status === "proposed" ? pc.cyan : ch.status === "merged" ? pc.green : ch.status === "denied" ? pc.red : pc.yellow;
+
+      console.log(pc.bold(ch.title || ch.chatTitle || changeId));
+      console.log(`Status:  ${statusColor(ch.status)}`);
+      console.log(`Branch:  ${ch.branchName || "-"}`);
+      console.log(`Author:  ${ch.proposedBy || "-"}`);
+      if (ch.createdAt) console.log(`Age:     ${formatAge(ch.createdAt)}`);
+      if (ch.description) {
+        console.log();
+        console.log(ch.description);
+      }
+      if (res.files && res.files.length > 0) {
+        console.log();
+        console.log(pc.bold("Files changed:"));
+        for (const f of res.files) {
+          const sign = f.status === "added" ? pc.green("+") : f.status === "deleted" ? pc.red("-") : pc.yellow("~");
+          console.log(`  ${sign} ${f.path}`);
+        }
+      }
+      console.log();
+      console.log(pc.dim(`${config.appUrl}/${remote.username}/${remote.slug}?change=${ch.id}`));
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.message : String(err);
+      console.error(pc.red("✗") + ` ${msg}`);
+      process.exit(1);
+    }
+  });
+
+// ============ st promote ============
+
+program
+  .command("promote")
+  .description("Promote dev branch to main")
+  .action(async () => {
+    requireGitRepo();
+    requireLogin();
+    const remote = requireStraylRemote();
+
+    console.log(pc.dim("Promoting dev → main..."));
+    try {
+      const res = await promoteToMain(remote.username, remote.slug) as any;
+      if (res.success) {
+        const sha = res.sha ? ` (sha: ${res.sha.slice(0, 7)})` : "";
+        console.log(pc.green("✓") + ` Promoted dev → main${sha}`);
+      } else {
+        console.error(pc.red("✗") + ` Promote failed: ${res.error || "Unknown error"}`);
+        process.exit(1);
+      }
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.message : String(err);
+      console.error(pc.red("✗") + ` ${msg}`);
+      process.exit(1);
+    }
+  });
+
+// ============ st pull ============
+
+program
+  .command("pull [target]")
+  .description("Pull from dev or main (default: dev)")
+  .action(async (target: string | undefined) => {
+    requireGitRepo();
+    requireLogin();
+    requireStraylRemote();
+
+    const branch = target === "main" ? "main" : "dev";
+
+    const { spawn } = await import("node:child_process");
+    // Fetch and merge
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn("git", ["fetch", "strayl"], { stdio: "inherit" });
+      child.on("exit", (code) => code === 0 ? resolve() : reject(new Error(`fetch failed`)));
+    }).catch((err) => {
+      console.error(pc.red("✗") + ` ${err.message}`);
+      process.exit(1);
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn("git", ["merge", `strayl/${branch}`], { stdio: "inherit" });
+      child.on("exit", (code) => code === 0 ? resolve() : reject(new Error(`merge failed`)));
+    }).catch((err) => {
+      console.error(pc.red("✗") + ` ${err.message}`);
+      process.exit(1);
+    });
+  });
+
+// ============ st status ============
+
+program
+  .command("status")
+  .description("Show project and change status")
+  .action(async () => {
+    requireGitRepo();
+    requireLogin();
+    const remote = requireStraylRemote();
+    const config = getConfig();
+
+    let currentBranch = "";
+    try {
+      currentBranch = execSync("git rev-parse --abbrev-ref HEAD", { stdio: "pipe" }).toString().trim();
+    } catch {
+      currentBranch = "(unknown)";
+    }
+
+    let projInfo: any;
+    let changesRes: { changes: any[] };
+
+    try {
+      [projInfo, changesRes] = await Promise.all([
+        getProjectInfo(remote.username, remote.slug) as Promise<any>,
+        listChanges(remote.username, remote.slug, { status: "proposed" }),
+      ]);
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.message : String(err);
+      console.error(pc.red("✗") + ` ${msg}`);
+      process.exit(1);
+    }
+
+    const proj = projInfo?.project;
+
+    console.log(pc.bold("Project:") + ` ${remote.username}/${remote.slug} → ${pc.cyan(`${config.appUrl}/${remote.username}/${remote.slug}`)}`);
+    console.log(pc.bold("Branch: ") + ` ${currentBranch}`);
+    if (proj?.visibility) console.log(pc.bold("Visibility:") + ` ${proj.visibility}`);
+    console.log();
+
+    const pending = changesRes.changes;
+    if (pending.length === 0) {
+      console.log(pc.dim("No pending changes"));
+    } else {
+      console.log(pc.bold(`Pending changes (${pending.length}):`));
+      for (const ch of pending) {
+        const warning = ch.status === "needs_restack" ? pc.yellow(" ⚠") : "";
+        const id = (ch.id || "").slice(0, 10).padEnd(12);
+        const title = (ch.title || ch.chatTitle || "").slice(0, 40).padEnd(40);
+        console.log(`  ${id}  ${title}  ${pc.cyan(ch.status)}${warning}`);
+      }
+    }
   });
 
 // ============ Parse & Run ============
