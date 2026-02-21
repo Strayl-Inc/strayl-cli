@@ -796,6 +796,49 @@ program
     }
   });
 
+// ============ st mcp-init ============
+
+program
+  .command("mcp-init")
+  .description("Install the Strayl MCP server into your coding agents")
+  .option("-y, --yes", "Skip all prompts, auto-detect agents")
+  .option("-g, --global", "Install globally (user directory) instead of project")
+  .option("-a, --agent <agent>", "Target specific agent (repeatable): claude-code, cursor, vscode, zed...", (v, prev: string[]) => [...prev, v], [] as string[])
+  .option("--all", "Install to all supported agents")
+  .option("--name <name>", "MCP server name", "strayl")
+  .option("--transport <type>", "Transport type: http (default) or sse", "http")
+  .addHelpText("after", `
+Examples:
+  $ st mcp-init                        Interactive — auto-detects agents
+  $ st mcp-init -y                     Auto-detect, skip prompts
+  $ st mcp-init -a claude-code -y      Install to Claude Code only
+  $ st mcp-init -a cursor -a vscode    Install to Cursor and VS Code
+  $ st mcp-init --all -g -y            Install globally to all agents
+
+Supported agents: claude-code, claude-desktop, cursor, vscode, zed, codex, opencode, gemini-cli, goose, github-copilot-cli`)
+  .action((options) => {
+    const MCP_URL = "https://api.strayl.dev/mcp";
+
+    const args: string[] = ["add-mcp", MCP_URL, "--name", options.name];
+
+    if (options.transport && options.transport !== "http") {
+      args.push("--transport", options.transport);
+    }
+    if (options.all) args.push("--all");
+    if (options.global) args.push("-g");
+    if (options.yes) args.push("-y");
+    for (const agent of options.agent) {
+      args.push("-a", agent);
+    }
+
+    console.log(pc.bold("Installing Strayl MCP server..."));
+    console.log(pc.dim(`  npx ${args.join(" ")}`));
+    console.log();
+
+    const result = spawnSync("npx", args, { stdio: "inherit" });
+    process.exit(result.status ?? 0);
+  });
+
 // ============ Parse & Run ============
 
 program.parse();
