@@ -247,17 +247,75 @@ program
 /**
  * Get { username, slug } from the 'strayl' git remote URL.
  * e.g. https://api.strayl.dev/alice/myapp.git → { username: "alice", slug: "myapp" }
+ * Falls back to any remote pointing to the configured Strayl API host.
  */
 function getProjectFromRemote(): { username: string; slug: string } | null {
-  try {
-    const url = execSync("git remote get-url strayl", { stdio: "pipe" }).toString().trim();
-    // e.g. https://api.strayl.dev/alice/myapp.git
+  const parseStraylUrl = (url: string) => {
+    const apiHost = new URL(getConfig().apiUrl).host;
+    if (!url.includes(apiHost)) return null;
     const match = url.match(/\/([^/]+)\/([^/]+?)(?:\.git)?$/);
     if (!match) return null;
     return { username: match[1], slug: match[2] };
+  };
+
+  // First, try the canonical 'strayl' remote
+  try {
+    const url = execSync("git remote get-url strayl", { stdio: "pipe" }).toString().trim();
+    const result = parseStraylUrl(url);
+    if (result) return result;
   } catch {
-    return null;
+    // No 'strayl' remote — fall through to scan all remotes
   }
+
+  // Fallback: find any remote pointing to the Strayl API
+  try {
+    const remotes = execSync("git remote", { stdio: "pipe" }).toString().trim().split("\n").filter(Boolean);
+    for (const remote of remotes) {
+      try {
+        const url = execSync(`git remote get-url ${remote}`, { stdio: "pipe" }).toString().trim();
+        const result = parseStraylUrl(url);
+        if (result) return result;
+      } catch {
+        // skip
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  return null;
+}
+
+/**
+ * Get the name of the git remote pointing to the Strayl API.
+ * Prefers the canonical 'strayl' remote; falls back to any matching remote.
+ */
+function getStraylRemoteName(): string | null {
+  const apiHost = new URL(getConfig().apiUrl).host;
+  const isStraylUrl = (url: string) => url.includes(apiHost);
+
+  try {
+    const url = execSync("git remote get-url strayl", { stdio: "pipe" }).toString().trim();
+    if (isStraylUrl(url)) return "strayl";
+  } catch {
+    // No 'strayl' remote
+  }
+
+  try {
+    const remotes = execSync("git remote", { stdio: "pipe" }).toString().trim().split("\n").filter(Boolean);
+    for (const remote of remotes) {
+      try {
+        const url = execSync(`git remote get-url ${remote}`, { stdio: "pipe" }).toString().trim();
+        if (isStraylUrl(url)) return remote;
+      } catch {
+        // skip
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  return null;
 }
 
 /**
@@ -276,13 +334,11 @@ function requireGitRepo(): void {
  * Ensure user is NOT already linked to a Strayl remote.
  */
 function requireNoStraylRemote(): void {
-  try {
-    execSync("git remote get-url strayl", { stdio: "pipe" });
+  const remoteName = getStraylRemoteName();
+  if (remoteName) {
     console.error(pc.red("✗") + " Already linked to a Strayl project");
     console.error(pc.dim("  Run 'st status' to see the current project"));
     process.exit(1);
-  } catch {
-    // Good — no remote means we can proceed
   }
 }
 
@@ -476,6 +532,7 @@ program
     requireGitRepo();
     requireLogin();
     const remote = requireStraylRemote();
+    const remoteName = getStraylRemoteName()!;
 
     // Determine current branch
     let branch: string;
@@ -507,7 +564,7 @@ program
     console.log(pc.dim(`Pushing ${branch} to strayl...`));
     const { spawn } = await import("node:child_process");
     await new Promise<void>((resolve, reject) => {
-      const child = spawn("git", ["push", "strayl", `${branch}:${branch}`], { stdio: "inherit" });
+      const child = spawn("git", ["push", remoteName, `${branch}:${branch}`], { stdio: "inherit" });
       child.on("exit", (code) => {
         if (code === 0) resolve();
         else reject(new Error(`git push exited with code ${code}`));
@@ -517,7 +574,7 @@ program
       process.exit(1);
     });
 
-    console.log(pc.green("✓") + ` Pushed ${pc.bold(branch)} → strayl`);
+    console.log(pc.green("✓") + ` Pushed ${pc.bold(branch)} → ${remoteName}`);
 
     if (options.change === false) {
       return;
@@ -723,11 +780,12 @@ program
     requireStraylRemote();
 
     const branch = target === "main" ? "main" : "dev";
+    const remoteName = getStraylRemoteName()!;
 
     const { spawn } = await import("node:child_process");
     // Fetch and merge
     await new Promise<void>((resolve, reject) => {
-      const child = spawn("git", ["fetch", "strayl"], { stdio: "inherit" });
+      const child = spawn("git", ["fetch", remoteName], { stdio: "inherit" });
       child.on("exit", (code) => code === 0 ? resolve() : reject(new Error(`fetch failed`)));
     }).catch((err) => {
       console.error(pc.red("✗") + ` ${err.message}`);
@@ -735,7 +793,7 @@ program
     });
 
     await new Promise<void>((resolve, reject) => {
-      const child = spawn("git", ["merge", `strayl/${branch}`], { stdio: "inherit" });
+      const child = spawn("git", ["merge", `${remoteName}/${branch}`], { stdio: "inherit" });
       child.on("exit", (code) => code === 0 ? resolve() : reject(new Error(`merge failed`)));
     }).catch((err) => {
       console.error(pc.red("✗") + ` ${err.message}`);
