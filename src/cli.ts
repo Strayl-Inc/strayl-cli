@@ -10,7 +10,7 @@ import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { join, basename } from "node:path";
 import { login } from "./auth.js";
-import { getCredentials, deleteCredentials, getConfig, saveConfig, getConfigDir } from "./config.js";
+import { getCredentials, deleteCredentials, getConfig, saveConfig, getConfigDir, saveCredentials } from "./config.js";
 import {
   ApiError,
   createProject,
@@ -369,6 +369,35 @@ function requireLogin() {
 }
 
 /**
+ * Silently refresh the session token if it expires within 48 hours.
+ * Updates expiresAt in ~/.strayl/credentials on success.
+ */
+async function tryRefreshToken(creds: NonNullable<ReturnType<typeof getCredentials>>): Promise<void> {
+  const expiresAt = new Date(creds.expiresAt);
+  const msUntilExpiry = expiresAt.getTime() - Date.now();
+  const FORTY_EIGHT_HOURS = 48 * 60 * 60 * 1000;
+
+  if (msUntilExpiry > FORTY_EIGHT_HOURS) return;
+
+  const config = getConfig();
+
+  try {
+    const res = await fetch(`${config.apiUrl}/auth/refresh`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${creds.token}` },
+    });
+
+    if (res.ok) {
+      const data = await res.json() as { expiresAt: string };
+      saveCredentials({ ...creds, expiresAt: data.expiresAt });
+    }
+    // On 401 or other errors, silently continue — push will fail with auth error
+  } catch {
+    // Network error, silently continue
+  }
+}
+
+/**
  * Require the strayl remote to exist and return username/slug.
  */
 function requireStraylRemote(): { username: string; slug: string } {
@@ -530,7 +559,8 @@ program
   .option("--no-change", "Just push the branch, skip creating a change")
   .action(async (branchArg: string | undefined, options) => {
     requireGitRepo();
-    requireLogin();
+    const creds = requireLogin();
+    await tryRefreshToken(creds);
     const remote = requireStraylRemote();
     const remoteName = getStraylRemoteName()!;
 
@@ -560,17 +590,31 @@ program
       }
     }
 
+    // Ensure git credentials are in sync before pushing
+    setupGitCredentials();
+
     // Push the branch
     console.log(pc.dim(`Pushing ${branch} to strayl...`));
     const { spawn } = await import("node:child_process");
+    let stderrOutput = "";
     await new Promise<void>((resolve, reject) => {
-      const child = spawn("git", ["push", remoteName, `${branch}:${branch}`], { stdio: "inherit" });
+      const child = spawn("git", ["push", remoteName, `${branch}:${branch}`], {
+        stdio: ["inherit", "inherit", "pipe"],
+      });
+      child.stderr?.on("data", (data: Buffer) => {
+        process.stderr.write(data);
+        stderrOutput += data.toString();
+      });
       child.on("exit", (code) => {
         if (code === 0) resolve();
         else reject(new Error(`git push exited with code ${code}`));
       });
     }).catch((err) => {
-      console.error(pc.red("✗") + ` Push failed: ${err.message}`);
+      if (stderrOutput.includes("Authentication failed") || stderrOutput.includes("could not read Username")) {
+        console.error(pc.red("✗") + " Authentication failed. Run 'st logout && st login' to refresh credentials");
+      } else {
+        console.error(pc.red("✗") + ` Push failed: ${err.message}`);
+      }
       process.exit(1);
     });
 
