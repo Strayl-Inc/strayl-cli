@@ -1,6 +1,6 @@
 {
   "name": "@strayl/cli",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Strayl CLI - Git hosting and deployment platform",
   "type": "module",
   "bin": {

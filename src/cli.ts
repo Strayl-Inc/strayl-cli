@@ -83,7 +83,7 @@ const program = new Command();
 program
   .name("st")
   .description("Strayl CLI - Git hosting and deployment platform")
-  .version("0.2.0");
+  .version("0.2.3");
 
 // ============ Login ============
 
