@@ -187,18 +187,23 @@ program
 
 program
   .command("clone <repo>")
-  .description("Clone a Strayl repository")
+  .description("Clone a Strayl repository (auto-checks out dev)")
   .argument("[directory]", "Directory to clone into")
   .action(async (repo: string, directory?: string) => {
     const config = getConfig();
 
     // Parse repo: can be "username/repo" or full URL
     let repoUrl: string;
+    let repoSlug = repo; // e.g. "alice/my-app"
 
     if (repo.includes("://")) {
       repoUrl = repo;
+      // Extract slug from URL for display
+      try {
+        const u = new URL(repo);
+        repoSlug = u.pathname.replace(/^\//, "").replace(/\.git$/, "");
+      } catch {}
     } else {
-      // Assume format: username/repo
       if (!repo.includes("/")) {
         console.error(pc.red("✗") + " Invalid repository format. Use: username/repo");
         process.exit(1);
@@ -206,15 +211,69 @@ program
       repoUrl = `${config.apiUrl}/${repo}.git`;
     }
 
+    // Determine target directory
+    const cloneDir = directory ?? basename(repoUrl.replace(/\.git$/, ""));
+
+    // Setup credentials if logged in (don't require login for public repos)
+    setupGitCredentials();
+
     const { spawn } = await import("node:child_process");
     const args = ["clone", repoUrl];
     if (directory) args.push(directory);
 
-    const child = spawn("git", args, { stdio: "inherit" });
-
-    child.on("exit", (code) => {
-      process.exit(code ?? 0);
+    // Clone with stderr capture for error handling
+    let stderrOutput = "";
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn("git", args, {
+        stdio: ["inherit", "inherit", "pipe"],
+      });
+      child.stderr?.on("data", (data: Buffer) => {
+        stderrOutput += data.toString();
+      });
+      child.on("exit", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`git clone exited with code ${code}`));
+      });
+    }).catch(() => {
+      if (stderrOutput.includes("Authentication failed") || stderrOutput.includes("could not read Username")) {
+        console.error(pc.red("✗") + " Authentication failed. Run 'st login' first");
+      } else if (stderrOutput.includes("already exists and is not an empty directory")) {
+        console.error(pc.red("✗") + ` Directory '${cloneDir}' already exists`);
+      } else {
+        // Show raw git error
+        process.stderr.write(stderrOutput);
+      }
+      process.exit(1);
     });
+
+    // Auto-checkout dev if it exists
+    let currentBranch = "main";
+    try {
+      const devRef = execSync("git branch -r --list \"origin/dev\"", { cwd: cloneDir, stdio: "pipe" }).toString().trim();
+      if (devRef) {
+        try {
+          execSync("git checkout dev", { cwd: cloneDir, stdio: "pipe" });
+        } catch {
+          // checkout failed — stay on default branch
+        }
+      }
+    } catch {
+      // branch listing failed (e.g. empty repo) — skip
+    }
+
+    try {
+      currentBranch = execSync("git branch --show-current", { cwd: cloneDir, stdio: "pipe" }).toString().trim() || currentBranch;
+    } catch {}
+
+    // Post-clone summary
+    console.log("");
+    console.log(pc.green("✓") + ` Cloned ${pc.bold(repoSlug)}`);
+    console.log("");
+    console.log(`  Branch:  ${pc.cyan(currentBranch)}`);
+    console.log(`  Path:    ${pc.dim(`./${cloneDir}`)}`);
+    console.log("");
+    console.log(`  cd ${cloneDir}`);
+    console.log("");
   });
 
 // ============ Git Credential Setup ============
